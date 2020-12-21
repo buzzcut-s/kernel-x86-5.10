@@ -520,6 +520,7 @@ static enum lru_status shadow_lru_isolate(struct list_head *item,
 {
 	struct xa_node *node = container_of(item, struct xa_node, private_list);
 	struct address_space *mapping;
+	bool empty = false;
 	int ret;
 
 	/*
@@ -558,11 +559,14 @@ static enum lru_status shadow_lru_isolate(struct list_head *item,
 	if (WARN_ON_ONCE(node->count != node->nr_values))
 		goto out_invalid;
 	mapping->nrexceptional -= node->nr_values;
+	empty = mapping_empty(mapping);
 	xa_delete_node(node, workingset_update_node);
 	__inc_lruvec_slab_state(node, WORKINGSET_NODERECLAIM);
 
 out_invalid:
 	xa_unlock_irq(&mapping->i_pages);
+	if (empty)
+		inode_pages_clear(mapping->host);
 	ret = LRU_REMOVED_RETRY;
 out:
 	cond_resched();
