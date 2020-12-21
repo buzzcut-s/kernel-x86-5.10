@@ -3250,10 +3250,6 @@ static ssize_t ksm_write(struct file *file, const char __user *buf,
 	}
 
 	mmap_write_lock(mm);
-	if (!mmget_still_valid(mm)) {
-		err = -EINVAL;
-		goto skip_mm;
-	}
 
 	err = 0;
 
@@ -3268,7 +3264,6 @@ static ssize_t ksm_write(struct file *file, const char __user *buf,
 		vma = vma->vm_next;
 	}
 
-skip_mm:
 	mmap_write_unlock(mm);
 
 	mmput(mm);
