@@ -11124,11 +11124,9 @@ enum skl_power_gate {
 #define  GEN9_TIMESTAMP_OVERRIDE_US_COUNTER_DENOMINATOR_MASK	(0xf << 12)
 
 #define _PIPE_FRMTMSTMP_A		0x70048
-#define _PIPE_FLIPTMSTMP_A		0x7004C
 #define PIPE_FRMTMSTMP(pipe)		\
 			_MMIO_PIPE2(pipe, _PIPE_FRMTMSTMP_A)
-#define PIPE_FLIPTMSTMP(pipe)		\
-			_MMIO_PIPE2(pipe, _PIPE_FLIPTMSTMP_A)
+
 /* BXT MIPI clock controls */
 #define BXT_MAX_VAR_OUTPUT_KHZ			39500
 
