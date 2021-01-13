@@ -6332,12 +6332,6 @@ static unsigned int bfq_update_depths(struct bfq_data *bfqd,
 	/*
 	 * In-word depths if no bfq_queue is being weight-raised:
 	 * leaving 25% of tags only for sync reads.
-	 *
-	 * In next formulas, right-shift the value
-	 * (1U<<bt->sb.shift), instead of computing directly
-	 * (1U<<(bt->sb.shift - something)), to be robust against
-	 * any possible value of bt->sb.shift, without having to
-	 * limit 'something'.
 	 */
 	/* no more than 50% of tags for async I/O */
 	bfqd->word_depths[0][0] = max(bt->sb.depth >> 1, 1U);
