@@ -46,9 +46,6 @@ static struct stats waketime_stats, wakeup_stats;
 static unsigned int threads_starting, nthreads = 0;
 static int futex_flag = 0;
 
-/* Should we use futex2 API? */
-static bool futex2 = false;
-
 static const struct option options[] = {
 	OPT_UINTEGER('t', "threads", &nthreads, "Specify amount of threads"),
 	OPT_UINTEGER('w', "nwakes",  &nwakes,   "Specify amount of threads to wake at once"),
@@ -72,13 +69,8 @@ static void *workerfn(void *arg __maybe_unused)
 	pthread_mutex_unlock(&thread_lock);
 
 	while (1) {
-		if (!futex2) {
-			if (futex_wait(&futex1, 0, NULL, futex_flag) != EINTR)
-				break;
-		} else {
-			if (futex2_wait(&futex1, 0, futex_flag, NULL) != EINTR)
-				break;
-		}
+		if (futex_wait(&futex1, 0, NULL, futex_flag) != EINTR)
+			break;
 	}
 
 	pthread_exit(NULL);
@@ -126,7 +118,7 @@ static void toggle_done(int sig __maybe_unused,
 	done = true;
 }
 
-static int bench_futex_wake_common(int argc, const char **argv)
+int bench_futex_wake(int argc, const char **argv)
 {
 	int ret = 0;
 	unsigned int i, j;
@@ -156,9 +148,7 @@ static int bench_futex_wake_common(int argc, const char **argv)
 	if (!worker)
 		err(EXIT_FAILURE, "calloc");
 
-	if (futex2)
-		futex_flag = FUTEX_32 | (fshared * FUTEX_SHARED_FLAG);
-	else if (!fshared)
+	if (!fshared)
 		futex_flag = FUTEX_PRIVATE_FLAG;
 
 	printf("Run summary [PID %d]: blocking on %d threads (at [%s] futex %p), "
@@ -191,13 +181,8 @@ static int bench_futex_wake_common(int argc, const char **argv)
 		/* Ok, all threads are patiently blocked, start waking folks up */
 		gettimeofday(&start, NULL);
 		while (nwoken != nthreads)
-			if (!futex2) {
-				nwoken += futex_wake(&futex1, nwakes, futex_flag);
-			} else {
-				nwoken += futex2_wake(&futex1, nwakes, futex_flag);
-		}
+			nwoken += futex_wake(&futex1, nwakes, futex_flag);
 		gettimeofday(&end, NULL);
-
 		timersub(&end, &start, &runtime);
 
 		update_stats(&wakeup_stats, nwoken);
@@ -226,15 +211,4 @@ static int bench_futex_wake_common(int argc, const char **argv)
 
 	free(worker);
 	return ret;
-}
-
-int bench_futex_wake(int argc, const char **argv)
-{
-	return bench_futex_wake_common(argc, argv);
-}
-
-int bench_futex2_wake(int argc, const char **argv)
-{
-	futex2 = true;
-	return bench_futex_wake_common(argc, argv);
 }
