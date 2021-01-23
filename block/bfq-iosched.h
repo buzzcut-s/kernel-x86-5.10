@@ -524,6 +524,8 @@ struct bfq_data {
 
 	/* true if the device is non rotational and performs queueing */
 	bool nonrot_with_queueing;
+	/* true if need to check num_groups_with_pending_reqs */
+	bool check_active_group;
 
 	/*
 	 * Maximum number of requests in driver in the last
@@ -1066,6 +1068,17 @@ static inline void bfq_pid_to_str(int pid, char *str, int len)
 }
 
 #ifdef CONFIG_BFQ_GROUP_IOSCHED
+static inline void bfqd_enable_active_group_check(struct bfq_data *bfqd)
+{
+	cmpxchg_relaxed(&bfqd->check_active_group, false, true);
+}
+
+static inline bool bfqd_has_active_group(struct bfq_data *bfqd)
+{
+	return bfqd->check_active_group &&
+	       bfqd->num_groups_with_pending_reqs > 0;
+}
+
 struct bfq_group *bfqq_group(struct bfq_queue *bfqq);
 
 #define bfq_log_bfqq(bfqd, bfqq, fmt, args...)	do {			\
@@ -1085,6 +1098,12 @@ struct bfq_group *bfqq_group(struct bfq_queue *bfqq);
 } while (0)
 
 #else /* CONFIG_BFQ_GROUP_IOSCHED */
+static inline void bfqd_enable_active_group_check(struct bfq_data *bfqd) {}
+
+static inline bool bfqd_has_active_group(struct bfq_data *bfqd)
+{
+	return false;
+}
 
 #define bfq_log_bfqq(bfqd, bfqq, fmt, args...) do {	\
 	char pid_str[MAX_PID_STR_LENGTH];	\
