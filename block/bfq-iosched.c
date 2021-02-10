@@ -699,8 +699,11 @@ static bool bfq_asymmetric_scenario(struct bfq_data *bfqd,
 		(bfqd->busy_queues[0] && bfqd->busy_queues[2]) ||
 		(bfqd->busy_queues[1] && bfqd->busy_queues[2]);
 
-	return varied_queue_weights || multiple_classes_busy ||
-	       bfqd_has_active_group(bfqd);
+	return varied_queue_weights || multiple_classes_busy
+#ifdef CONFIG_BFQ_GROUP_IOSCHED
+	       || bfqd->num_groups_with_pending_reqs > 0
+#endif
+		;
 }
 
 /*
@@ -1668,19 +1671,15 @@ static void bfq_bfqq_handle_idle_busy_switch(struct bfq_data *bfqd,
 	 * - it is sync,
 	 * - it does not belong to a large burst,
 	 * - it has been idle for enough time or is soft real-time,
-	 * - is linked to a bfq_io_cq (it is not shared in any sense),
-	 * - has a default weight (otherwise we assume the user wanted
-	 *   to control its weight explicitly)
+	 * - is linked to a bfq_io_cq (it is not shared in any sense).
 	 */
 	in_burst = bfq_bfqq_in_large_burst(bfqq);
 	soft_rt = bfqd->bfq_wr_max_softrt_rate > 0 &&
 		!BFQQ_TOTALLY_SEEKY(bfqq) &&
 		!in_burst &&
 		time_is_before_jiffies(bfqq->soft_rt_next_start) &&
-		bfqq->dispatched == 0 &&
-		bfqq->entity.new_weight == 40;
-	*interactive = !in_burst && idle_for_long_time &&
-		bfqq->entity.new_weight == 40;
+		bfqq->dispatched == 0;
+	*interactive = !in_burst && idle_for_long_time;
 	wr_or_deserves_wr = bfqd->low_latency &&
 		(bfqq->wr_coeff > 1 ||
 		 (bfq_bfqq_sync(bfqq) &&
@@ -1930,8 +1929,9 @@ static void bfq_add_request(struct request *rq)
 		 * I/O-plugging interval for bfqq.
 		 */
 		if (bfqd->last_completed_rq_bfqq &&
+		    !bfq_bfqq_has_short_ttime(bfqq) &&
 		    ktime_get_ns() - bfqd->last_completion <
-		    4 * NSEC_PER_MSEC) {
+		    200 * NSEC_PER_USEC) {
 			if (bfqd->last_completed_rq_bfqq != bfqq &&
 			    bfqd->last_completed_rq_bfqq !=
 			    bfqq->waker_bfqq) {
@@ -2167,7 +2167,7 @@ static void bfq_remove_request(struct request_queue *q,
 	bfqd->queued--;
 	elv_rb_del(&bfqq->sort_list, rq);
 
-	elv_rqhash_del(rq);
+	elv_rqhash_del(q, rq);
 	if (q->last_merge == rq)
 		q->last_merge = NULL;
 
@@ -2352,24 +2352,6 @@ static void bfq_requests_merged(struct request_queue *q, struct request *rq,
 /* Must be called with bfqq != NULL */
 static void bfq_bfqq_end_wr(struct bfq_queue *bfqq)
 {
-	/*
-	 * If bfqq has been enjoying interactive weight-raising, then
-	 * reset soft_rt_next_start. We do it for the following
-	 * reason. bfqq may have been conveying the I/O needed to load
-	 * a soft real-time application. Such an application actually
-	 * exhibits a soft real-time I/O pattern after it finishes
-	 * loading, and finally starts doing its job. But, if bfqq has
-	 * been receiving a lot of bandwidth so far (likely to happen
-	 * on a fast device), then soft_rt_next_start now contains a
-	 * high value that. So, without this reset, bfqq would be
-	 * prevented from being possibly considered as soft_rt for a
-	 * very long time.
-	 */
-
-	if (bfqq->wr_cur_max_time !=
-	    bfqq->bfqd->bfq_wr_rt_max_time)
-		bfqq->soft_rt_next_start = jiffies;
-
 	if (bfq_bfqq_busy(bfqq))
 		bfqq->bfqd->wr_busy_queues--;
 	bfqq->wr_coeff = 1;
@@ -2955,7 +2937,6 @@ static void __bfq_set_in_service_queue(struct bfq_data *bfqd,
 	}
 
 	bfqd->in_service_queue = bfqq;
-	bfqd->in_serv_last_pos = -1;
 }
 
 /*
@@ -3461,38 +3442,20 @@ static void bfq_dispatch_remove(struct request_queue *q, struct request *rq)
  * order until all the requests already queued in the device have been
  * served. The last sub-condition commented above somewhat mitigates
  * this problem for weight-raised queues.
- *
- * However, as an additional mitigation for this problem, we preserve
- * plugging for a special symmetric case that may suddenly turn into
- * asymmetric: the case where only bfqq is busy. In this case, not
- * expiring bfqq does not cause any harm to any other queues in terms
- * of service guarantees. In contrast, it avoids the following unlucky
- * sequence of events: (1) bfqq is expired, (2) a new queue with a
- * lower weight than bfqq becomes busy (or more queues), (3) the new
- * queue is served until a new request arrives for bfqq, (4) when bfqq
- * is finally served, there are so many requests of the new queue in
- * the drive that the pending requests for bfqq take a lot of time to
- * be served. In particular, event (2) may case even already
- * dispatched requests of bfqq to be delayed, inside the drive. So, to
- * avoid this series of events, the scenario is preventively declared
- * as asymmetric also if bfqq is the only busy queues
  */
 static bool idling_needed_for_service_guarantees(struct bfq_data *bfqd,
 						 struct bfq_queue *bfqq)
 {
-	int tot_busy_queues = bfq_tot_busy_queues(bfqd);
-
 	/* No point in idling for bfqq if it won't get requests any longer */
 	if (unlikely(!bfqq_process_refs(bfqq)))
 		return false;
 
 	return (bfqq->wr_coeff > 1 &&
 		(bfqd->wr_busy_queues <
-		 tot_busy_queues ||
+		 bfq_tot_busy_queues(bfqd) ||
 		 bfqd->rq_in_driver >=
 		 bfqq->dispatched + 4)) ||
-		bfq_asymmetric_scenario(bfqd, bfqq) ||
-		tot_busy_queues == 1;
+		bfq_asymmetric_scenario(bfqd, bfqq);
 }
 
 static bool __bfq_bfqq_expire(struct bfq_data *bfqd, struct bfq_queue *bfqq,
@@ -3989,15 +3952,30 @@ void bfq_bfqq_expire(struct bfq_data *bfqd,
 		 * If we get here, and there are no outstanding
 		 * requests, then the request pattern is isochronous
 		 * (see the comments on the function
-		 * bfq_bfqq_softrt_next_start()). Therefore we can
-		 * compute soft_rt_next_start.
+		 * bfq_bfqq_softrt_next_start()). Thus we can compute
+		 * soft_rt_next_start. And we do it, unless bfqq is in
+		 * interactive weight raising. We do not do it in the
+		 * latter subcase, for the following reason. bfqq may
+		 * be conveying the I/O needed to load a soft
+		 * real-time application. Such an application will
+		 * actually exhibit a soft real-time I/O pattern after
+		 * it finally starts doing its job. But, if
+		 * soft_rt_next_start is computed here for an
+		 * interactive bfqq, and bfqq had received a lot of
+		 * service before remaining with no outstanding
+		 * request (likely to happen on a fast device), then
+		 * soft_rt_next_start would be assigned such a high
+		 * value that, for a very long time, bfqq would be
+		 * prevented from being possibly considered as soft
+		 * real time.
 		 *
 		 * If, instead, the queue still has outstanding
 		 * requests, then we have to wait for the completion
 		 * of all the outstanding requests to discover whether
 		 * the request pattern is actually isochronous.
 		 */
-		if (bfqq->dispatched == 0)
+		if (bfqq->dispatched == 0 &&
+		    bfqq->wr_coeff != bfqd->bfq_wr_coeff)
 			bfqq->soft_rt_next_start =
 				bfq_bfqq_softrt_next_start(bfqd, bfqq);
 		else if (bfqq->dispatched > 0) {
@@ -4521,7 +4499,7 @@ check_queue:
 			bfqq = bfqq->bic->bfqq[0];
 		else if (bfq_bfqq_has_waker(bfqq) &&
 			   bfq_bfqq_busy(bfqq->waker_bfqq) &&
-			   bfqq->waker_bfqq->next_rq &&
+			   bfqq->next_rq &&
 			   bfq_serv_to_charge(bfqq->waker_bfqq->next_rq,
 					      bfqq->waker_bfqq) <=
 			   bfq_bfqq_budget_left(bfqq->waker_bfqq)
@@ -4581,21 +4559,9 @@ static void bfq_update_wr_data(struct bfq_data *bfqd, struct bfq_queue *bfqq)
 						bfqq->wr_cur_max_time)) {
 			if (bfqq->wr_cur_max_time != bfqd->bfq_wr_rt_max_time ||
 			time_is_before_jiffies(bfqq->wr_start_at_switch_to_srt +
-					       bfq_wr_duration(bfqd))) {
-				/*
-				 * Either in interactive weight
-				 * raising, or in soft_rt weight
-				 * raising with the
-				 * interactive-weight-raising period
-				 * elapsed (so no switch back to
-				 * interactive weight raising).
-				 */
+					       bfq_wr_duration(bfqd)))
 				bfq_bfqq_end_wr(bfqq);
-			} else { /*
-				  * soft_rt finishing while still in
-				  * interactive period, switch back to
-				  * interactive weight raising
-				  */
+			else {
 				switch_back_to_interactive_wr(bfqq, bfqd);
 				bfqq->entity.prio_changed = 1;
 			}
@@ -5046,8 +5012,6 @@ bfq_set_next_ioprio_data(struct bfq_queue *bfqq, struct bfq_io_cq *bic)
 	}
 
 	bfqq->entity.new_weight = bfq_ioprio_to_weight(bfqq->new_ioprio);
-	bfq_log_bfqq(bfqd, bfqq, "new_ioprio %d new_weight %d",
-		     bfqq->new_ioprio, bfqq->entity.new_weight);
 	bfqq->entity.prio_changed = 1;
 }
 
@@ -5230,19 +5194,11 @@ static void bfq_update_io_thinktime(struct bfq_data *bfqd,
 				    struct bfq_queue *bfqq)
 {
 	struct bfq_ttime *ttime = &bfqq->ttime;
-	u64 elapsed;
+	u64 elapsed = ktime_get_ns() - bfqq->ttime.last_end_request;
 
-	/*
-	 * We are really interested in how long it takes for the queue to
-	 * become busy when there is no outstanding IO for this queue. So
-	 * ignore cases when the bfq queue has already IO queued.
-	 */
-	if (bfqq->dispatched || bfq_bfqq_busy(bfqq))
-		return;
-	elapsed = ktime_get_ns() - bfqq->ttime.last_end_request;
 	elapsed = min_t(u64, elapsed, 2ULL * bfqd->bfq_slice_idle);
 
-	ttime->ttime_samples = (7*ttime->ttime_samples + 256) / 8;
+	ttime->ttime_samples = (7*bfqq->ttime.ttime_samples + 256) / 8;
 	ttime->ttime_total = div_u64(7*ttime->ttime_total + 256*elapsed,  8);
 	ttime->ttime_mean = div64_ul(ttime->ttime_total + 128,
 				     ttime->ttime_samples);
@@ -5282,13 +5238,12 @@ static void bfq_update_has_short_ttime(struct bfq_data *bfqd,
 		return;
 
 	/* Think time is infinite if no process is linked to
-	 * bfqq. Otherwise check average think time to decide whether
-	 * to mark as has_short_ttime. To this goal, compare average
-	 * think time with half the I/O-plugging timeout.
+	 * bfqq. Otherwise check average think time to
+	 * decide whether to mark as has_short_ttime
 	 */
 	if (atomic_read(&bic->icq.ioc->active_ref) == 0 ||
 	    (bfq_sample_valid(bfqq->ttime.ttime_samples) &&
-	     bfqq->ttime.ttime_mean > bfqd->bfq_slice_idle>>1))
+	     bfqq->ttime.ttime_mean > bfqd->bfq_slice_idle))
 		has_short_ttime = false;
 
 	state_changed = has_short_ttime != bfq_bfqq_has_short_ttime(bfqq);
@@ -6369,15 +6324,21 @@ static unsigned int bfq_update_depths(struct bfq_data *bfqd,
 	/*
 	 * In-word depths if no bfq_queue is being weight-raised:
 	 * leaving 25% of tags only for sync reads.
+	 *
+	 * In next formulas, right-shift the value
+	 * (1U<<bt->sb.shift), instead of computing directly
+	 * (1U<<(bt->sb.shift - something)), to be robust against
+	 * any possible value of bt->sb.shift, without having to
+	 * limit 'something'.
 	 */
 	/* no more than 50% of tags for async I/O */
-	bfqd->word_depths[0][0] = max(bt->sb.depth >> 1, 1U);
+	bfqd->word_depths[0][0] = max((1U << bt->sb.shift) >> 1, 1U);
 	/*
 	 * no more than 75% of tags for sync writes (25% extra tags
 	 * w.r.t. async I/O, to prevent async I/O from starving sync
 	 * writes)
 	 */
-	bfqd->word_depths[0][1] = max((bt->sb.depth * 3) >> 2, 1U);
+	bfqd->word_depths[0][1] = max(((1U << bt->sb.shift) * 3) >> 2, 1U);
 
 	/*
 	 * In-word depths in case some bfq_queue is being weight-
@@ -6387,9 +6348,9 @@ static unsigned int bfq_update_depths(struct bfq_data *bfqd,
 	 * shortage.
 	 */
 	/* no more than ~18% of tags for async I/O */
-	bfqd->word_depths[1][0] = max((bt->sb.depth * 3) >> 4, 1U);
+	bfqd->word_depths[1][0] = max(((1U << bt->sb.shift) * 3) >> 4, 1U);
 	/* no more than ~37% of tags for sync writes (~20% extra tags) */
-	bfqd->word_depths[1][1] = max((bt->sb.depth * 6) >> 4, 1U);
+	bfqd->word_depths[1][1] = max(((1U << bt->sb.shift) * 6) >> 4, 1U);
 
 	for (i = 0; i < 2; i++)
 		for (j = 0; j < 2; j++)
@@ -6511,7 +6472,6 @@ static int bfq_init_queue(struct request_queue *q, struct elevator_type *e)
 
 	bfqd->queue_weights_tree = RB_ROOT_CACHED;
 	bfqd->num_groups_with_pending_reqs = 0;
-	bfqd->check_active_group = false;
 
 	INIT_LIST_HEAD(&bfqd->active_list);
 	INIT_LIST_HEAD(&bfqd->idle_list);
