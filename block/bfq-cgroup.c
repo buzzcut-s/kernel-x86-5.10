@@ -505,18 +505,12 @@ static struct blkcg_policy_data *bfq_cpd_alloc(gfp_t gfp)
 	return &bgd->pd;
 }
 
-static inline int bfq_dft_weight(void)
-{
-	return cgroup_subsys_on_dfl(io_cgrp_subsys) ?
-	       CGROUP_WEIGHT_DFL : BFQ_WEIGHT_LEGACY_DFL;
-
-}
-
 static void bfq_cpd_init(struct blkcg_policy_data *cpd)
 {
 	struct bfq_group_data *d = cpd_to_bfqgd(cpd);
 
-	d->weight = bfq_dft_weight();
+	d->weight = cgroup_subsys_on_dfl(io_cgrp_subsys) ?
+		CGROUP_WEIGHT_DFL : BFQ_WEIGHT_LEGACY_DFL;
 }
 
 static void bfq_cpd_free(struct blkcg_policy_data *cpd)
@@ -553,6 +547,8 @@ static void bfq_pd_init(struct blkg_policy_data *pd)
 
 	entity->orig_weight = entity->weight = entity->new_weight = d->weight;
 	entity->my_sched_data = &bfqg->sched_data;
+	entity->last_bfqq_created = NULL;
+
 	bfqg->my_entity = entity; /*
 				   * the root_group's will be set to NULL
 				   * in bfq_init_queue()
@@ -560,9 +556,6 @@ static void bfq_pd_init(struct blkg_policy_data *pd)
 	bfqg->bfqd = bfqd;
 	bfqg->active_entities = 0;
 	bfqg->rq_pos_tree = RB_ROOT;
-
-	if (entity->new_weight != bfq_dft_weight())
-		bfqd_enable_active_group_check(bfqd);
 }
 
 static void bfq_pd_free(struct blkg_policy_data *pd)
@@ -1022,7 +1015,6 @@ static void bfq_group_set_weight(struct bfq_group *bfqg, u64 weight, u64 dev_wei
 		 */
 		smp_wmb();
 		bfqg->entity.prio_changed = 1;
-		bfqd_enable_active_group_check(bfqg->bfqd);
 	}
 }
 
